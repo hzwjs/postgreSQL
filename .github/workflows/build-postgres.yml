@@ -108,6 +108,18 @@ jobs:
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: 'trivy-results.sarif'
+      # 8. 构建下载
+      - name: Export image as tar
+        run: |
+          docker pull ghcr.io/hzwjs/postgres-kylin:latest
+          docker save ghcr.io/hzwjs/postgres-kylin:latest | gzip > postgres-kylin.tar.gz
+
+      - name: Upload image tar as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: postgres-kylin-image
+          path: postgres-kylin.tar.gz
+          retention-days: 7
 
   # 可选：验证镜像能正常启动
   test:
