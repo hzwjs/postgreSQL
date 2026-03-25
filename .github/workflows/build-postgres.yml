@@ -1,0 +1,135 @@
+# .github/workflows/build-postgres.yml
+name: Build PostgreSQL Image for Kylin V10
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'docker/**'
+      - '.github/workflows/build-postgres.yml'
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # 每周一凌晨 2 点自动重建（获取安全更新）
+    - cron: '0 18 * * 0'
+  workflow_dispatch:
+    inputs:
+      pg_version:
+        description: 'PostgreSQL 版本 (如 16, 15, 14)'
+        required: false
+        default: '16'
+
+env:
+  REGISTRY: ghcr.io                          # 或换成你的私有仓库
+  IMAGE_NAME: ${{ github.repository }}/postgres-kylin
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # 1. 检出代码
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. 设置 QEMU（支持多平台构建，此处主要确保 amd64）
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # 3. 设置 Docker Buildx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 4. 登录到容器镜像仓库
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # （可选）登录私有仓库，如公司 Harbor
+      # - name: Log in to private registry
+      #   uses: docker/login-action@v3
+      #   with:
+      #     registry: your-harbor.example.com
+      #     username: ${{ secrets.HARBOR_USER }}
+      #     password: ${{ secrets.HARBOR_PASSWORD }}
+
+      # 5. 提取镜像元数据（自动生成 tag）
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=schedule,pattern=weekly
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-
+            # 固定 tag：pg16-kylin
+            type=raw,value=pg${{ github.event.inputs.pg_version || '16' }}-kylin
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # 6. 构建并推送（仅限 linux/amd64，匹配麒麟 V10）
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./docker
+          file: ./docker/Dockerfile
+          platforms: linux/amd64          # 麒麟 V10 x86_64，只需此平台
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 启用构建缓存（加速后续构建）
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            PG_VERSION=${{ github.event.inputs.pg_version || '16' }}
+
+      # 7. 安全扫描（可选，扫描镜像漏洞）
+      - name: Run Trivy vulnerability scanner
+        if: github.event_name != 'pull_request'
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy scan results
+        if: github.event_name != 'pull_request'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # 可选：验证镜像能正常启动
+  test:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - name: Pull and test image
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          # 启动容器，验证 PostgreSQL 能正常运行
+          docker run -d \
+            --name pg-test \
+            --platform linux/amd64 \
+            -e POSTGRES_PASSWORD=testpass \
+            -e POSTGRES_DB=testdb \
+            -p 5432:5432 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+          # 等待 PostgreSQL 就绪
+          sleep 10
+          docker exec pg-test pg_isready -U postgres
+          echo "✅ PostgreSQL 容器启动测试通过"
+
+          docker rm -f pg-test
